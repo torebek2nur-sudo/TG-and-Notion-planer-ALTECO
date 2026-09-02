@@ -1,0 +1,208 @@
+import os
+import json
+import logging
+from datetime import datetime
+
+import requests
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ConversationHandler,
+    ContextTypes,
+    filters,
+)
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("uzb-report-bot")
+
+# ---------------------------------------------------------------------------
+# Config (all secrets come from environment variables — see .env.example)
+# ---------------------------------------------------------------------------
+TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+NOTION_TOKEN = os.environ["NOTION_TOKEN"]
+# The "Дистрибуция UZB" page — clients are its child pages
+UZB_ROOT_PAGE_ID = os.environ["UZB_ROOT_PAGE_ID"]
+
+NOTION_VERSION = "2022-06-28"
+NOTION_HEADERS = {
+    "Authorization": f"Bearer {NOTION_TOKEN}",
+    "Notion-Version": NOTION_VERSION,
+    "Content-Type": "application/json",
+}
+
+# managers.json maps each manager's Telegram user id to their name and
+# (optionally) a list of substrings used to filter which client pages they see.
+# If "clients_filter" is an empty list, the manager sees the FULL client list.
+with open(os.path.join(os.path.dirname(__file__), "managers.json"), encoding="utf-8") as f:
+    MANAGERS = {int(k): v for k, v in json.load(f).items()}
+
+# Conversation states
+CHOOSING_CLIENT, TYPING_REPORT = range(2)
+
+CLIENTS_PER_PAGE = 8
+
+
+# ---------------------------------------------------------------------------
+# Notion helpers
+# ---------------------------------------------------------------------------
+def notion_list_child_pages(page_id: str):
+    """Return [{'id':..., 'title':...}, ...] for direct child_page blocks."""
+    results = []
+    url = f"https://api.notion.com/v1/blocks/{page_id}/children?page_size=100"
+    while url:
+        resp = requests.get(url, headers=NOTION_HEADERS, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        for block in data.get("results", []):
+            if block.get("type") == "child_page":
+                results.append({
+                    "id": block["id"],
+                    "title": block["child_page"]["title"],
+                })
+        if data.get("has_more"):
+            url = f"https://api.notion.com/v1/blocks/{page_id}/children?page_size=100&start_cursor={data['next_cursor']}"
+        else:
+            url = None
+    return results
+
+
+def notion_append_report(page_id: str, manager_name: str, text: str):
+    """Append a callout block with the report to the client's Notion page."""
+    today = datetime.now().strftime("%d.%m.%Y %H:%M")
+    body = f"[{today}] {manager_name}\n{text}"
+    payload = {
+        "children": [
+            {
+                "object": "block",
+                "type": "callout",
+                "callout": {
+                    "icon": {"type": "emoji", "emoji": "📝"},
+                    "rich_text": [
+                        {
+                            "type": "text",
+                            "text": {"content": body},
+                        }
+                    ],
+                },
+            }
+        ]
+    }
+    url = f"https://api.notion.com/v1/blocks/{page_id}/children"
+    resp = requests.patch(url, headers=NOTION_HEADERS, json=payload, timeout=30)
+    resp.raise_for_status()
+
+
+# ---------------------------------------------------------------------------
+# Telegram handlers
+# ---------------------------------------------------------------------------
+def build_client_keyboard(clients, page: int = 0):
+    start = page * CLIENTS_PER_PAGE
+    chunk = clients[start:start + CLIENTS_PER_PAGE]
+    buttons = [
+        [InlineKeyboardButton(c["title"][:60], callback_data=f"client:{c['id']}")]
+        for c in chunk
+    ]
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"page:{page-1}"))
+    if start + CLIENTS_PER_PAGE < len(clients):
+        nav.append(InlineKeyboardButton("Вперёд ➡️", callback_data=f"page:{page+1}"))
+    if nav:
+        buttons.append(nav)
+    return InlineKeyboardMarkup(buttons)
+
+
+async def report_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    manager = MANAGERS.get(user_id)
+    if not manager:
+        await update.message.reply_text(
+            "У вас нет доступа к этому боту. Обратитесь к руководителю, чтобы добавили ваш Telegram ID."
+        )
+        return ConversationHandler.END
+
+    all_clients = notion_list_child_pages(UZB_ROOT_PAGE_ID)
+    filters_list = manager.get("clients_filter") or []
+    if filters_list:
+        clients = [c for c in all_clients if any(f.lower() in c["title"].lower() for f in filters_list)]
+    else:
+        clients = all_clients
+
+    if not clients:
+        await update.message.reply_text("Не нашёл ни одного клиента. Проверьте настройки managers.json.")
+        return ConversationHandler.END
+
+    context.user_data["clients"] = clients
+    await update.message.reply_text(
+        f"{manager['name']}, выберите клиента:",
+        reply_markup=build_client_keyboard(clients, 0),
+    )
+    return CHOOSING_CLIENT
+
+
+async def page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    page = int(query.data.split(":")[1])
+    clients = context.user_data["clients"]
+    await query.edit_message_reply_markup(reply_markup=build_client_keyboard(clients, page))
+    return CHOOSING_CLIENT
+
+
+async def client_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    page_id = query.data.split(":", 1)[1]
+    clients = context.user_data["clients"]
+    client = next(c for c in clients if c["id"] == page_id)
+    context.user_data["chosen_client"] = client
+    await query.edit_message_text(f"Клиент: {client['title']}\n\nНапишите отчёт — о чём договорились:")
+    return TYPING_REPORT
+
+
+async def report_text_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    manager = MANAGERS[user_id]
+    client = context.user_data["chosen_client"]
+    text = update.message.text
+
+    try:
+        notion_append_report(client["id"], manager["name"], text)
+    except Exception as e:
+        log.exception("Failed to write to Notion")
+        await update.message.reply_text(f"Не удалось записать в Notion: {e}")
+        return ConversationHandler.END
+
+    await update.message.reply_text(f"✅ Отчёт по «{client['title']}» записан в Notion.")
+    return ConversationHandler.END
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Отменено.")
+    return ConversationHandler.END
+
+
+def main():
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    conv = ConversationHandler(
+        entry_points=[CommandHandler("report", report_start)],
+        states={
+            CHOOSING_CLIENT: [
+                CallbackQueryHandler(page_callback, pattern=r"^page:"),
+                CallbackQueryHandler(client_chosen, pattern=r"^client:"),
+            ],
+            TYPING_REPORT: [MessageHandler(filters.TEXT & ~filters.COMMAND, report_text_received)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+    app.add_handler(conv)
+    log.info("Bot started")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
